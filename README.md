@@ -22,7 +22,7 @@ Or paste the GitHub URL in Settings > Plugins:
 
 In Settings > Plugins, allow YouTube Music to start programs. To get your library, click **Sign In** and sign in to Google in the window that opens.
 
-It needs MyGo Music 0.1.8 or later, and only starts ffmpeg and yt-dlp: from the PATH, `/opt/homebrew/bin` or `/usr/local/bin`. If they're somewhere else, link them into one of those.
+It needs MyGo Music 0.1.22 or later and starts ffmpeg and yt-dlp from the PATH, `/opt/homebrew/bin` or `/usr/local/bin`. If they're somewhere else, link them into one of those.
 
 The plugin follows the language selected in MyGo Music. Traditional Chinese is available in builds of MyGo Music that offer that language.
 
@@ -38,7 +38,9 @@ You sign in on Google's page, in a window of the app. The session is kept unencr
 
 ## How it plays
 
-Tracks are fetched the way YouTube's Vision Pro app fetches them, then ffmpeg converts them to MP3 on the fly. If that fails, yt-dlp is used instead; it can take up to 15 seconds to start, and needs you signed in from a VPN or server network. The audio is lossy.
+The plugin queries MyGo Music for compatible container and codec pairs. It passes a supported progressive stream straight to the player. For AAC-LC that needs repackaging, FFmpeg copies the packets into ADTS without re-encoding. Formats with no supported output container use MP3. With older builds, AAC-LC uses the ADTS relay. The quality setting controls the bitrate of the MP3 output.
+
+The yt-dlp fallback can take up to 15 seconds to start and may require signing in from a VPN or server network. When it resolves a compatible progressive M4A with a known size, MyGo can seek using byte ranges, just like a direct YouTube M4A.
 
 ## Lyrics
 

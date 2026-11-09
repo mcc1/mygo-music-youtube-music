@@ -1,7 +1,7 @@
 // YouTube Music, for personal use. The catalog comes from the API its website
 // calls. A track's audio is found as YouTube's app for the Vision Pro asks for
-// it, which is given addresses that play as they are, and ffmpeg turns it into
-// the MP3 the app can play, as neither AAC nor Opus is something it decodes.
+// it, which is given addresses that play as they are. The app plays supported
+// streams directly; ffmpeg repackages compatible codecs or encodes MP3.
 // Should YouTube stop answering that app, yt-dlp finds the audio instead, if
 // it's installed. Your library takes your own session, which signing in on
 // Google's page in a window of the app gives, as its cookies.
@@ -832,9 +832,31 @@ async function visitorData() {
   return visitor;
 }
 
-// The audio of the highest bit rate, as yt-dlp picks it: in the track's own
-// language, and as it was mixed, rather than the copy with its range
-// compressed, which YouTube lists beside it.
+const codecs = { "mp4a.40.2": "aac-lc", "mp4a.40.5": "he-aac", "mp4a.40.29": "he-aac", opus: "opus", vorbis: "vorbis" };
+const containers = {
+  mp4: { container: "mp4", type: "m4a" },
+  m4a: { container: "mp4", type: "m4a" },
+  webm: { container: "webm", type: "webm" },
+  ogg: { container: "ogg", type: "ogg" },
+};
+
+function supportsAudio(container, codec, delivery) {
+  if (typeof host.supportsAudio === "function") return host.supportsAudio(container, codec, delivery);
+  // MyGo 0.1.22 can consume the ADTS relay even without the query.
+  return container === "adts" && codec === "aac-lc" && delivery === "progressive";
+}
+
+function playbackPlan(source, allowDirect) {
+  if (allowDirect && source.container && source.codec && supportsAudio(source.container, source.codec, source.delivery)) {
+    return { direct: true, type: source.type };
+  }
+  if (source.codec && supportsAudio("adts", source.codec, "progressive")) return { muxer: "adts", type: "aac" };
+  if (source.codec && supportsAudio("ogg", source.codec, "progressive")) return { muxer: "ogg", type: "ogg" };
+  return { type: "mp3" };
+}
+
+// Prefer direct playback, then a stream copy. Within each route keep the
+// highest bitrate in the track's own language and without range compression.
 async function direct(id) {
   const r = await call("player", { videoId: id, contentCheckOk: true, racyCheckOk: true }, visionOS(await visitorData()));
   const status = r.playabilityStatus || {};
@@ -843,13 +865,33 @@ async function direct(id) {
     throw status.status === "UNPLAYABLE" || status.status === "ERROR" ? fail("unavailable", why) : new Error(why);
   }
   let best = null;
+  let bestRank = -1;
   for (const f of r.streamingData?.adaptiveFormats || []) {
     if (!f.mimeType?.startsWith("audio/") || !f.url || f.isDrc) continue;
     if (f.audioTrack && !f.audioTrack.audioIsDefault) continue;
-    if (!best || f.bitrate > best.bitrate) best = f;
+    const [, ext, codec] = /^audio\/([\w-]+)\s*;\s*codecs="([^"]+)"$/i.exec(f.mimeType) || [];
+    const candidate = {
+      ...containers[ext?.toLowerCase()],
+      codec: codecs[codec?.toLowerCase()],
+      delivery: "progressive",
+      url: f.url,
+      bitRate: f.bitrate,
+      size: Number(f.contentLength) || undefined,
+    };
+    const plan = playbackPlan(candidate, true);
+    const rank = plan.direct ? 2 : plan.muxer ? 1 : 0;
+    if (rank > bestRank || (rank === bestRank && candidate.bitRate > best.bitRate)) {
+      best = candidate;
+      bestRank = rank;
+    }
   }
   if (!best) throw new Error(t("YouTube listed no audio to play as it is"));
-  return { url: best.url, http_headers: { "User-Agent": webUA }, gain: gainOf(r.playerConfig?.audioConfig), direct: true };
+  return {
+    ...best,
+    http_headers: { "User-Agent": webUA },
+    gain: gainOf(r.playerConfig?.audioConfig),
+    direct: true,
+  };
 }
 
 // The app's gain is ReplayGain's, which brings a track to -18 LUFS, and YouTube
@@ -879,7 +921,7 @@ async function throughYtdlp(id, why) {
     "--config-locations", "-",
     "--no-warnings", "--no-playlist", "--no-progress",
     ...whatYtdlpAsks(),
-    "--print", "%(.{url,http_headers})j",
+    "--print", "%(.{url,http_headers,ext,acodec,protocol,vcodec,abr,filesize})j",
   ];
   for (const runtime of ["deno", "node", "bun"]) {
     const path = await program(runtime, "--version");
@@ -899,7 +941,17 @@ async function throughYtdlp(id, why) {
   const code = await proc.wait();
   clearTimeout(timer);
   if (code !== 0 || !lines.length) throw ytdlpFailure(proc.errorOutput());
-  return { ...JSON.parse(lines[lines.length - 1]), direct: false };
+  const source = JSON.parse(lines[lines.length - 1]);
+  return {
+    ...source,
+    ...containers[source.ext],
+    codec: codecs[source.acodec],
+    delivery: source.vcodec === "none" && (source.protocol === "https" || source.protocol === "http")
+      ? "progressive" : "segmented",
+    size: Number(source.filesize) || undefined,
+    bitRate: Number.isFinite(source.abr) ? Math.round(source.abr * 1000) : undefined,
+    direct: false,
+  };
 }
 
 // Which of YouTube's apps yt-dlp asks as, and for what. Signed out, its own
@@ -941,7 +993,7 @@ async function asksInPieces(ffmpeg) {
   return (ranged = found);
 }
 
-// ffmpeg serves the MP3 itself, to the one request that comes for it, and so
+// ffmpeg serves the audio itself, to the one request that comes for it, and so
 // lets the track start before all of it is there. No more than a few wait at a
 // time, for what was skipped before it was ever asked for.
 const serving = [];
@@ -952,7 +1004,7 @@ function stopWaiting() {
   while (serving.length >= servingAtMost) serving.shift().kill();
 }
 
-async function serve(source, bitRate) {
+async function serve(source, plan, bitRate) {
   const ffmpeg = await program("ffmpeg", "-version");
   if (!ffmpeg) {
     throw fail("setup", t("YouTube Music plays through ffmpeg: install it with Homebrew, or so that it's on the PATH"));
@@ -961,6 +1013,9 @@ async function serve(source, bitRate) {
   stopWaiting();
   const headers = source.http_headers || {};
   const port = 20000 + Math.floor(Math.random() * 40000);
+  const output = plan.muxer
+    ? ["-c:a", "copy", "-f", plan.muxer]
+    : ["-c:a", "libmp3lame", "-b:a", `${bitRate}k`, "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3"];
   const proc = host.spawn(ffmpeg, [
     "-nostdin", "-hide_banner", "-nostats",
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
@@ -968,8 +1023,7 @@ async function serve(source, bitRate) {
     ...(pieces ? ["-request_size", String(10 << 20)] : []),
     ...(headers["User-Agent"] ? ["-user_agent", headers["User-Agent"]] : []),
     "-i", source.url,
-    "-vn", "-c:a", "libmp3lame", "-b:a", `${bitRate}k`, "-id3v2_version", "0", "-write_xing", "0",
-    "-f", "mp3", "-listen", "1", `http://127.0.0.1:${port}/`,
+    "-vn", ...output, "-listen", "1", `http://127.0.0.1:${port}/`,
   ]);
   proc.closeStdin();
   let stopped = false;
@@ -996,12 +1050,27 @@ async function serve(source, bitRate) {
   return `http://127.0.0.1:${port}/`;
 }
 
-export async function stream({ id, quality }) {
+export async function stream({ id, quality, fallback }) {
   const kbps = quality === "standard" ? 128 : 192;
   let source = await locate(id);
+  let plan = playbackPlan(source, !fallback);
+  if (plan.direct) {
+    const size = Number.isSafeInteger(source.size) && source.size > 0 ? source.size : undefined;
+    return {
+      url: source.url,
+      type: plan.type,
+      headers: source.http_headers?.["User-Agent"] ? { "User-Agent": source.http_headers["User-Agent"] } : undefined,
+      size,
+      byteRanges: plan.type === "m4a" && size !== undefined,
+      quality: kbps === 128 ? "standard" : "high",
+      bitRate: source.bitRate,
+      gain: source.gain,
+      fallback: true,
+    };
+  }
   let url;
   try {
-    url = await serve(source, kbps);
+    url = await serve(source, plan, kbps);
   } catch (e) {
     // An address may stop working before it said it would, and YouTube now and
     // then turns down one it just gave out: yt-dlp may find one that works.
@@ -1009,14 +1078,15 @@ export async function stream({ id, quality }) {
     if (!source.direct || e.code === "setup") throw e;
     console.warn(`playing ${id} as YouTube gave it: ${e.message}`);
     source = { ...(await throughYtdlp(id, e)), gain: source.gain, at: Date.now() };
-    url = await serve(source, kbps);
+    plan = playbackPlan(source, false);
+    url = await serve(source, plan, kbps);
     located.set(id, source);
   }
   return {
     url,
-    type: "mp3",
+    type: plan.type,
     quality: kbps === 128 ? "standard" : "high",
-    bitRate: kbps * 1000,
+    bitRate: plan.muxer ? source.bitRate : kbps * 1000,
     gain: source.gain,
   };
 }
