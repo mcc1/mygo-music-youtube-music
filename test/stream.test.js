@@ -157,3 +157,64 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     globalThis.fetch = originalFetch;
   }
 });
+test("only an explicit Music Premium restriction retries with the signed-in account", async () => {
+  const originalFetch = globalThis.fetch;
+  let active = true;
+  const requests = [];
+  const audio = { mimeType: 'audio/mp4; codecs="mp4a.40.2"', bitrate: 135000, contentLength: "3000000" };
+  const guestReason = "這部影片僅供 Music Premium 會員收看";
+  globalThis.host.youtubeAccount = { state: () => ({ active }) };
+  globalThis.host.supportsAudio = (c, codec, delivery) => c === "mp4" && codec === "aac-lc" && delivery === "progressive";
+  globalThis.host.spawn = () => { throw new Error("Premium media must not be passed to a subprocess"); };
+  globalThis.fetch = async (url, options) => {
+    expect(new URL(url).origin).toBe("https://music.youtube.com");
+    const account = !!options.headers["x-mygo-youtube-account"];
+    if (url.includes("/visitor_id?")) {
+      expect(account).toBe(false);
+      return Response.json({ responseContext: { visitorData: "guest" } });
+    }
+    const { videoId, context: { client } } = JSON.parse(options.body);
+    requests.push({ videoId, account, client: client.clientName });
+    const success = (source) => Response.json({ playabilityStatus: { status: "OK" }, streamingData: { adaptiveFormats: [source] } });
+    if (videoId === "public") return success({ ...audio, url: "https://audio.example/public" });
+    if (videoId === "other-block") return Response.json({ playabilityStatus: { status: "UNPLAYABLE", reason: "Not available in your country" } });
+    if (!account) return Response.json({ playabilityStatus: { status: "UNPLAYABLE", reason: guestReason } });
+    if (videoId === "premium-cipher") return success({ ...audio, signatureCipher: "example" });
+    if (videoId === "premium-foreign") return success({ ...audio, url: "https://googlevideo.com.example.net/audio" });
+    return success({ ...audio, url: "https://rr.example.googlevideo.com/videoplayback" });
+  };
+  try {
+    expect(await stream({ id: "public", quality: "high" })).toMatchObject({ type: "m4a" });
+    const result = await stream({ id: "premium-direct", quality: "high" });
+    expect(result).toMatchObject({ type: "m4a", fallback: false, headers: { "User-Agent": expect.any(String) } });
+    expect(Object.keys(result.headers)).toEqual(["User-Agent"]);
+    await expect(stream({ id: "premium-cipher", quality: "high" })).rejects.toThrow("did not provide a directly playable audio stream");
+    globalThis.host.youtubeAccount.signatureTimestamp = async () => 12345;
+    globalThis.host.youtubeAccount.decipherAudio = async (stamp, cipher) => {
+      expect(stamp).toBe(12345);
+      expect(cipher).toBe("example");
+      return "https://rr.example.googlevideo.com/videoplayback";
+    };
+    expect(await stream({ id: "premium-cipher", quality: "high" })).toMatchObject({
+      type: "m4a", processing: "direct", fallback: false,
+      url: "https://rr.example.googlevideo.com/videoplayback",
+    });
+    await expect(stream({ id: "premium-foreign", quality: "high" })).rejects.toThrow("did not provide a directly playable audio stream");
+    await expect(stream({ id: "other-block", quality: "high" })).rejects.toThrow("Not available in your country");
+    active = false;
+    await expect(stream({ id: "premium-direct", quality: "high" })).rejects.toThrow(guestReason);
+    expect(requests.map(({ videoId, account }) => [videoId, account])).toEqual([
+      ["public", false], ["premium-direct", false], ["premium-direct", true],
+      ["premium-cipher", false], ["premium-cipher", true],
+      ["premium-cipher", false], ["premium-cipher", true],
+      ["premium-foreign", false], ["premium-foreign", true], ["other-block", false],
+      ["premium-direct", false],
+    ]);
+    expect(requests.filter((r) => r.account).every((r) => r.client === "WEB_REMIX")).toBe(true);
+  } finally {
+    globalThis.fetch = originalFetch;
+    delete globalThis.host.youtubeAccount;
+    delete globalThis.host.supportsAudio;
+    delete globalThis.host.spawn;
+  }
+});

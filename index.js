@@ -785,6 +785,11 @@ async function locate(id, preferOpus, key) {
   try {
     found = await direct(id, preferOpus);
   } catch (e) {
+    if (e.code === "premium") {
+      if (!signedIn()) throw fail("unavailable", e.message);
+      // Account-authorized media addresses are not reused by a later session.
+      return direct(id, preferOpus, true);
+    }
     // What YouTube won't play, yt-dlp can't either.
     if (e.code === "unavailable") throw e;
     console.warn(`finding ${id}'s audio: ${e.message}`);
@@ -832,28 +837,45 @@ function playbackPlan(source, allowDirect) {
 
 // Prefer direct playback, then a stream copy. Within each route keep the
 // highest bitrate in the track's own language and without range compression.
-async function direct(id, preferOpus) {
-  const r = await call("player", { videoId: id, contentCheckOk: true, racyCheckOk: true }, visionOS(await visitorData()));
+async function direct(id, preferOpus, account = false) {
+  const request = { videoId: id, contentCheckOk: true, racyCheckOk: true };
+  const solver = host.youtubeAccount;
+  const stamp = account && solver?.signatureTimestamp && solver?.decipherAudio
+    ? await solver.signatureTimestamp() : 0;
+  const r = account
+    ? await call("player", { ...request, playbackContext: { contentPlaybackContext: {
+        html5Preference: "HTML5_PREF_WANTS", ...(stamp ? { signatureTimestamp: stamp } : {}),
+      } } })
+    : await call("player", request, visionOS(await visitorData()));
   const status = r.playabilityStatus || {};
   if (status.status !== "OK") {
     const why = status.reason || `YouTube says ${status.status || "nothing"} of this`;
+    if (!account && status.status === "UNPLAYABLE" &&
+        /(?:only available to|available only to|exclusive to) (?:YouTube )?Music Premium members|(?:僅供|仅供|只限|只供).*Music Premium/i.test(why)) {
+      throw fail("premium", why);
+    }
+    if (account) throw new Error(why);
     throw status.status === "UNPLAYABLE" || status.status === "ERROR" ? fail("unavailable", why) : new Error(why);
   }
   let best = null;
   let bestRank = -1;
   for (const f of r.streamingData?.adaptiveFormats || []) {
-    if (!f.mimeType?.startsWith("audio/") || !f.url || f.isDrc) continue;
+    const cipher = stamp ? f.signatureCipher || f.cipher : undefined;
+    if (!f.mimeType?.startsWith("audio/") || !(f.url || cipher) || f.isDrc) continue;
     if (f.audioTrack && !f.audioTrack.audioIsDefault) continue;
+    if (account && f.url && !/^https:\/\/(?:[a-z0-9-]+\.)+googlevideo\.com\//i.test(f.url)) continue;
     const [, ext, codec] = /^audio\/([\w-]+)\s*;\s*codecs="([^"]+)"$/i.exec(f.mimeType) || [];
     const candidate = {
       ...containers[ext?.toLowerCase()],
       codec: codecs[codec?.toLowerCase()],
       delivery: "progressive",
       url: f.url,
+      cipher,
       bitRate: f.bitrate,
       size: Number(f.contentLength) || undefined,
     };
     const plan = playbackPlan(candidate, true);
+    if (account && !plan.direct) continue;
     const opus = candidate.codec === "opus";
     // Keep AAC the ordinary choice when both sources can play directly.
     let rank = plan.direct ? 2 : plan.muxer ? 1 : 0;
@@ -863,12 +885,17 @@ async function direct(id, preferOpus) {
       bestRank = rank;
     }
   }
-  if (!best) throw new Error(t("YouTube listed no audio to play as it is"));
+  if (!best) throw new Error(t(account
+    ? "YouTube Music accepted your account but did not provide a directly playable audio stream"
+    : "YouTube listed no audio to play as it is"));
+  const { cipher, ...audio } = best;
+  if (!audio.url && cipher) audio.url = await solver.decipherAudio(stamp, cipher);
   return {
-    ...best,
+    ...audio,
     http_headers: { "User-Agent": webUA },
     gain: gainOf(r.playerConfig?.audioConfig),
     direct: true,
+    account,
   };
 }
 
@@ -1017,7 +1044,7 @@ export async function stream({ id, quality, fallback, preferOpus = false }) {
   const kbps = quality === "standard" ? 128 : 192;
   const key = preferOpus ? `opus:${id}` : id;
   let source = await locate(id, preferOpus, key);
-  let plan = playbackPlan(source, !fallback);
+  let plan = playbackPlan(source, source.account || !fallback);
   if (plan.direct) {
     const size = Number.isSafeInteger(source.size) && source.size > 0 ? source.size : undefined;
     return {
@@ -1032,7 +1059,7 @@ export async function stream({ id, quality, fallback, preferOpus = false }) {
       quality: kbps === 128 ? "standard" : "high",
       bitRate: source.bitRate,
       gain: source.gain,
-      fallback: true,
+      fallback: !source.account,
     };
   }
   let url;
