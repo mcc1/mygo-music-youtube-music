@@ -416,6 +416,15 @@ export async function search({ query, kind, offset }) {
   return { [kind]: found, more: keepToken(key, offset + found.length, next) };
 }
 
+export async function youtubeTrack({ id }) {
+  if (typeof id !== "string" || !/^[A-Za-z0-9_-]{11}$/.test(id)) return null;
+  const queue = await call("music/get_queue", { videoIds: [id] });
+  const exact = (answer) => findAll(answer, "playlistPanelVideoRenderer")
+    .find((item) => item.videoId === id && textOf(item.title));
+  const item = exact(queue) || exact(await call("next", { videoId: id, isAudioOnly: true }));
+  return item ? panelTrack(item) : null;
+}
+
 export async function suggest({ query }) {
   const r = await call("music/get_search_suggestions", { input: query });
   return findAll(r, "searchSuggestionRenderer").map((s) => textOf(s.suggestion)).filter(Boolean);
