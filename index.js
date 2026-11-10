@@ -616,21 +616,23 @@ export async function stationNext() {
   return findAll(answer, "playlistPanelVideoRenderer").filter((v) => v.videoId !== seed).map(panelTrack);
 }
 
-// Lyrics, which the app only shows when they're timed. Better Lyrics times each
-// word, where YouTube times each line, so it goes first, and YouTube's are there
-// for what it doesn't have.
+// Prefer Better Lyrics' word timings, then YouTube's line timings and text.
 
 export async function lyrics({ id }) {
   const next = await call("next", { videoId: id, isAudioOnly: true }, android);
   const playing = findAll(next, "playlistPanelVideoRenderer").find((v) => v.videoId === id);
+  const lyricsId = youtubeLyricsID(next);
   const [better, own] = await Promise.allSettled([
     playing ? betterLyrics(panelTrack(playing)) : null,
-    youtubeLyrics(next),
+    youtubeLyrics(lyricsId),
   ]);
   if (better.status === "rejected") console.warn(`Better Lyrics: ${better.reason?.message}`);
   if (better.value?.lines.length) return better.value;
+  if (own.value?.lines.length) return own.value;
+  const plain = own.value?.plain || await youtubePlainLyrics(id, lyricsId);
+  if (plain) return { plain };
   if (own.status === "rejected") throw own.reason;
-  return own.value;
+  return { lines: [] };
 }
 
 // Better Lyrics answers only for songs it has kept, and says so with a status:
@@ -709,20 +711,31 @@ function linesOfTTML(ttml) {
   return lines;
 }
 
-async function youtubeLyrics(next) {
-  const lyricsId = findAll(next, "browseId").find((b) => /^MPLY/.test(b));
+const youtubeLyricsID = (next) => findAll(next, "browseId").find((b) => /^MPLY/.test(b));
+const youtubeLyricsText = (response) =>
+  textOf(findOne(response, "musicDescriptionShelfRenderer")?.description).trim();
+
+async function youtubeLyrics(lyricsId) {
   if (!lyricsId) return { lines: [] };
   const r = await call("browse", { browseId: lyricsId }, android);
   const timed = findOne(r, "timedLyricsData") || [];
-  return {
-    lines: timed
-      .filter((l) => l.lyricLine)
-      .map((l) => ({
-        start: Number(l.cueRange?.startTimeMilliseconds) || 0,
-        end: Number(l.cueRange?.endTimeMilliseconds) || 0,
-        text: l.lyricLine,
-      })),
-  };
+  const lines = timed
+    .filter((l) => l.lyricLine?.trim() && l.cueRange?.startTimeMilliseconds != null)
+    .map((l) => ({
+      start: Number(l.cueRange.startTimeMilliseconds),
+      end: Number(l.cueRange.endTimeMilliseconds) || 0,
+      text: l.lyricLine,
+    }))
+    .filter((l) => Number.isFinite(l.start) && l.start >= 0);
+  return lines.length ? { lines } : { lines, plain: youtubeLyricsText(r) };
+}
+
+async function youtubePlainLyrics(id, lyricsId) {
+  // The Android client can return an empty timed screen while the web
+  // client has a regular text shelf. Reuse its browse ID when possible.
+  lyricsId ||= youtubeLyricsID(await call("next", { videoId: id, isAudioOnly: true }));
+  if (!lyricsId) return "";
+  return youtubeLyricsText(await call("browse", { browseId: lyricsId }));
 }
 
 // Playing.
