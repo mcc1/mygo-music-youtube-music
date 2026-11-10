@@ -5,6 +5,7 @@ const { lyrics } = await import("../index.js");
 
 test("plain YouTube lyrics are shown only when neither provider has timings", async () => {
   const realFetch = globalThis.fetch;
+  globalThis.host.youtubeAccount = { state: () => ({ active: true }) };
   const webCalls = [];
   const plain = "First line\nSecond line\n\nAnother verse";
   const betterTTML = '<p begin="1s" end="2s"><span begin="1s" end="2s">Word timing</span></p>';
@@ -13,6 +14,8 @@ test("plain YouTube lyrics are shown only when neither provider has timings", as
     if (hostname === "api.betterlyrics.org") {
       return Response.json({ ttml: searchParams.get("s") === "better" ? betterTTML : "" });
     }
+    // YouTube's lyrics requests fail when the Android client carries web credentials.
+    if (options.headers["x-mygo-youtube-account"]) return new Response(null, { status: 400 });
     const { context: { client }, videoId, browseId } = JSON.parse(options.body);
     const web = client.clientName === "WEB_REMIX";
     if (web) webCalls.push([pathname, videoId ?? browseId]);
@@ -50,5 +53,6 @@ test("plain YouTube lyrics are shown only when neither provider has timings", as
     ]);
   } finally {
     globalThis.fetch = realFetch;
+    delete globalThis.host.youtubeAccount;
   }
 });

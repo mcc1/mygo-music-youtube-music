@@ -49,6 +49,8 @@ const remix = {
 const android = {
   client: { clientName: "ANDROID_MUSIC", clientVersion: "7.21.50", androidSdkVersion: 34 },
   headers: { "user-agent": "com.google.android.apps.youtube.music/7.21.50 (Linux; U; Android 14) gzip" },
+  // This client rejects the web session credentials used for the library.
+  anonymous: true,
 };
 
 // YouTube's app for the Vision Pro, which is given audio at addresses that need
@@ -733,9 +735,10 @@ async function youtubeLyrics(lyricsId) {
 async function youtubePlainLyrics(id, lyricsId) {
   // The Android client can return an empty timed screen while the web
   // client has a regular text shelf. Reuse its browse ID when possible.
-  lyricsId ||= youtubeLyricsID(await call("next", { videoId: id, isAudioOnly: true }));
+  const webLyrics = { ...remix, anonymous: true };
+  lyricsId ||= youtubeLyricsID(await call("next", { videoId: id, isAudioOnly: true }, webLyrics));
   if (!lyricsId) return "";
-  return youtubeLyricsText(await call("browse", { browseId: lyricsId }));
+  return youtubeLyricsText(await call("browse", { browseId: lyricsId }, webLyrics));
 }
 
 // Playing.
