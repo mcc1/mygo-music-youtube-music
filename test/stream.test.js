@@ -7,7 +7,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
   const originalFetch = globalThis.fetch;
   const input = {
     aac: { mimeType: 'audio/mp4; codecs="mp4a.40.2"', url: "https://audio.example/aac", bitrate: 130000, contentLength: "3000000" },
-    opus: { mimeType: 'audio/webm; codecs="opus"', url: "https://audio.example/opus", bitrate: 145000 },
+    opus: { mimeType: 'audio/webm; codecs="opus"', url: "https://audio.example/opus", bitrate: 145000, contentLength: "3200000" },
   };
   const commands = [];
   const ytdlpRuns = [];
@@ -25,7 +25,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     return Response.json({
       playabilityStatus: { status: "OK" },
       streamingData: {
-        adaptiveFormats: videoId === "with-aac"
+        adaptiveFormats: videoId === "with-aac" || videoId === "with-native"
           ? [input.opus, input.aac, { ...input.aac, url: "https://audio.example/drc", bitrate: 200000, isDrc: true }]
           : videoId === "aac-only" ? [input.aac]
           : [input.opus, { mimeType: 'audio/mp4; codecs="mp4a.40.5"', url: "https://audio.example/he-aac", bitrate: 50000 }],
@@ -141,6 +141,14 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     const { args: preferredArgs } = ytdlpRuns.at(-1);
     expect(preferredArgs[preferredArgs.indexOf("--format") + 1]).toStartWith("bestaudio[acodec=opus]");
     expect(preferredArgs).toContain("--no-cookies");
+    const supportsOgg = globalThis.host.supportsAudio;
+    globalThis.host.supportsAudio = (container, codec, delivery) =>
+      supportsOgg(container, codec, delivery) || (container === "webm" && codec === "opus" && delivery === "progressive");
+    expect(await stream({ id: "with-native", quality: "standard" })).toMatchObject({ type: "m4a", processing: "direct" });
+    expect(await streamWithOpus({ id: "with-native", quality: "standard" })).toMatchObject({
+      type: "webm", codec: "opus", processing: "direct", byteRanges: true, size: 3200000,
+    });
+    expect(commands).toHaveLength(6);
   } finally {
     for (const resolve of finish) resolve(0);
     delete globalThis.host.youtubeAccount;

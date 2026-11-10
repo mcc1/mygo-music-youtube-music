@@ -838,8 +838,10 @@ async function direct(id, preferOpus) {
       size: Number(f.contentLength) || undefined,
     };
     const plan = playbackPlan(candidate, true);
-    const rank = (plan.direct ? 2 : plan.muxer ? 1 : 0)
-      + (preferOpus && candidate.codec === "opus" && (plan.direct || plan.muxer) ? 3 : 0);
+    const opus = candidate.codec === "opus";
+    // Keep AAC the ordinary choice when both sources can play directly.
+    let rank = plan.direct ? 2 : plan.muxer ? 1 : 0;
+    if (opus && rank > 0) rank = preferOpus ? rank + 3 : 1;
     if (rank > bestRank || (rank === bestRank && candidate.bitRate > best.bitRate)) {
       best = candidate;
       bestRank = rank;
@@ -1010,7 +1012,7 @@ export async function stream({ id, quality, fallback, preferOpus = false }) {
       resolver: source.direct ? undefined : "anonymous-yt-dlp",
       headers: source.http_headers?.["User-Agent"] ? { "User-Agent": source.http_headers["User-Agent"] } : undefined,
       size,
-      byteRanges: plan.type === "m4a" && size !== undefined,
+      byteRanges: (plan.type === "m4a" || plan.type === "webm") && size !== undefined,
       quality: kbps === 128 ? "standard" : "high",
       bitRate: source.bitRate,
       gain: source.gain,
