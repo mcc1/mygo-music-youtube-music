@@ -4,6 +4,7 @@
   "version": "0.1.1",
   "minAppVersion": "0.1.22",
   "main": "index.js",
+  "youtubeAccount": true,
   "playback": "stream",
   "permissions": {
     "network": [

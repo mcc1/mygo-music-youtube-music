@@ -60,6 +60,7 @@ test("a language change reaches YouTube and its shelf title reaches the page", a
 test("the Google sign-in window requests the selected language", async () => {
   language = "zh-TW";
   const cancel = new Error("stop before opening the sign-in window");
+  globalThis.host.youtubeAccount = { state: () => ({ active: false }) };
   globalThis.host.webSignIn = async ({ url, cookiesOf }) => {
     const page = new URL(url);
     expect(page.origin).toBe("https://accounts.google.com");
@@ -72,6 +73,7 @@ test("the Google sign-in window requests the selected language", async () => {
     expect(storage.has("cookie")).toBe(false);
   } finally {
     delete globalThis.host.webSignIn;
+    delete globalThis.host.youtubeAccount;
     language = "en";
   }
 });

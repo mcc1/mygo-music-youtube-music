@@ -10,6 +10,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     opus: { mimeType: 'audio/webm; codecs="opus"', url: "https://audio.example/opus", bitrate: 145000 },
   };
   const commands = [];
+  const ytdlpRuns = [];
   const finish = [];
   globalThis.host.supportsAudio = (container, codec, delivery) =>
     ["mp4", "adts"].includes(container) && codec === "aac-lc" && delivery === "progressive";
@@ -18,7 +19,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
       return Response.json({ responseContext: { visitorData: "test" } });
     }
     const { videoId } = JSON.parse(options.body);
-    if (videoId === "hls" || videoId === "yt-dlp-direct") {
+    if (videoId === "hls" || videoId === "yt-dlp-direct" || videoId === "yt-dlp-blocked") {
       return Response.json({ playabilityStatus: { status: "OK" } });
     }
     return Response.json({
@@ -32,12 +33,22 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
   };
   globalThis.host.spawn = (program, args) => {
     if (program === "yt-dlp") {
+      const run = { args, stdin: [] };
+      ytdlpRuns.push(run);
+      const blocked = args.at(-1).endsWith("yt-dlp-blocked");
       const output = args.at(-1).endsWith("yt-dlp-direct")
         ? { url: "https://audio.example/fallback.m4a", ext: "m4a", protocol: "https", vcodec: "none", filesize: 1200000 }
         : { url: "https://audio.example/list.m3u8", ext: "mp4", protocol: "m3u8_native", vcodec: "avc1" };
-      const lines = args.includes("--print")
+      const lines = args.includes("--print") && !blocked
         ? [JSON.stringify({ ...output, acodec: "mp4a.40.2", abr: 130 })] : [];
-      return { write() {}, closeStdin() {}, readLine: async () => lines.shift() ?? null, wait: async () => 0, kill() {} };
+      return {
+        write: (data) => run.stdin.push(data),
+        closeStdin() {},
+        readLine: async () => lines.shift() ?? null,
+        wait: async () => blocked ? 1 : 0,
+        kill() {},
+        errorOutput: () => blocked ? "ERROR: [youtube] test: Sign in to confirm you're not a bot" : "",
+      };
     }
     if (program !== "ffmpeg") throw new Error("program missing");
     const serving = args.includes("-listen");
@@ -68,6 +79,8 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     expect(commands[1][commands[1].indexOf("-c:a") + 1]).toBe("libmp3lame");
     expect(commands[1][commands[1].indexOf("-f") + 1]).toBe("mp3");
 
+    // Even a signed-in listener resolves fallback audio without account cookies.
+    globalThis.host.youtubeAccount = { state: () => ({ active: true }) };
     const hls = await stream({ id: "hls", quality: "standard" });
     expect(hls.type).toBe("aac");
     expect(hls.byteRanges).toBeUndefined();
@@ -78,6 +91,20 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     expect(resolved.byteRanges).toBe(true);
     expect(resolved.size).toBe(1200000);
     expect(commands).toHaveLength(3);
+    await expect(stream({ id: "yt-dlp-blocked", quality: "standard" })).rejects.toThrow(
+      "YouTube did not allow anonymous playback of this track",
+    );
+    expect(globalThis.host.youtubeAccount.state().active).toBe(true);
+    expect(ytdlpRuns).toHaveLength(4);
+    for (const { args, stdin } of ytdlpRuns) {
+      expect(args).toEqual(expect.arrayContaining(["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser"]));
+      expect(args).not.toContain("--config-locations");
+      expect(args).not.toContain("--add-headers");
+      expect(stdin).toEqual([]);
+      if (args.includes("--print")) {
+        expect(args[args.indexOf("--extractor-args") + 1]).toBe("youtube:skip=hls,dash");
+      }
+    }
 
     delete globalThis.host.supportsAudio;
     const legacy = await stream({ id: "with-aac", quality: "standard" });
@@ -85,6 +112,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     expect(commands[3][commands[3].indexOf("-c:a") + 1]).toBe("copy");
   } finally {
     for (const resolve of finish) resolve(0);
+    delete globalThis.host.youtubeAccount;
     delete globalThis.host.spawn;
     delete globalThis.host.supportsAudio;
     globalThis.fetch = originalFetch;

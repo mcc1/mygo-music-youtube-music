@@ -8,8 +8,10 @@
   "Allow YouTube Music to start programs in its settings": "請在 YouTube Music 外掛的設定中允許啟動程式",
   "YouTube gave this visit no ID": "YouTube 未提供訪客 ID",
   "YouTube listed no audio to play as it is": "YouTube 未提供可直接播放的音訊",
-  "YouTube turned down your session: sign in again": "YouTube 拒絕了這次登入工作階段, 請重新登入",
-  "YouTube asks you to sign in to play this": "YouTube 要求登入後才能播放",
+  "YouTube did not allow anonymous playback of this track": "YouTube 拒絕匿名播放這首曲目",
+  "Update MyGo Music to sign in securely": "請更新 MyGo Music 以使用安全登入",
+  "The credential store is unavailable. This sign-in may end when MyGo Music closes": "無法使用系統憑證庫, 關閉 MyGo Music 後可能需要重新登入",
+  "The saved YouTube session could not be fully migrated to the credential store": "現有 YouTube 登入資料尚未完整移轉至系統憑證庫",
   "YouTube Music plays through ffmpeg: install it with Homebrew, or so that it's on the PATH": "YouTube Music 需要 ffmpeg 才能播放. 請安裝 ffmpeg 並加入 PATH",
   "the audio didn't start in time": "音訊播放逾時",
   "no such page": "找不到這個頁面"

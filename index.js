@@ -24,60 +24,12 @@ function fail(code, message) {
   return e;
 }
 
-// The session's cookies, as a Cookie header, kept in the plugin's storage.
-const cookie = () => host.storage.get("cookie") || "";
-
-function cookieValue(name) {
-  for (const part of cookie().split(";")) {
-    const at = part.indexOf("=");
-    if (part.slice(0, at).trim() === name) return part.slice(at + 1).trim();
-  }
-  return "";
-}
+const accountState = () => host.youtubeAccount?.state();
+const signedIn = () => accountState()?.active === true;
+const accountHeader = { "x-mygo-youtube-account": "1" };
 
 function needAccount() {
-  if (!cookie()) throw fail("signIn");
-}
-
-function sha1(text) {
-  const bytes = [...new TextEncoder().encode(text)];
-  const bits = bytes.length * 8;
-  bytes.push(0x80);
-  while (bytes.length % 64 !== 56) bytes.push(0);
-  for (let i = 7; i >= 0; i--) bytes.push(i >= 4 ? 0 : (bits >>> (i * 8)) & 0xff);
-  const rotl = (x, n) => (x << n) | (x >>> (32 - n));
-  const h = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
-  for (let at = 0; at < bytes.length; at += 64) {
-    const w = [];
-    for (let i = 0; i < 16; i++) {
-      w[i] = (bytes[at + i * 4] << 24) | (bytes[at + i * 4 + 1] << 16) | (bytes[at + i * 4 + 2] << 8) | bytes[at + i * 4 + 3];
-    }
-    for (let i = 16; i < 80; i++) w[i] = rotl(w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16], 1);
-    let [a, b, c, d, e] = h;
-    for (let i = 0; i < 80; i++) {
-      const [f, k] =
-        i < 20 ? [(b & c) | (~b & d), 0x5a827999]
-        : i < 40 ? [b ^ c ^ d, 0x6ed9eba1]
-        : i < 60 ? [(b & c) | (b & d) | (c & d), 0x8f1bbcdc]
-        : [b ^ c ^ d, 0xca62c1d6];
-      const t = (rotl(a, 5) + f + e + k + w[i]) | 0;
-      [e, d, c, b, a] = [d, c, rotl(b, 30), a, t];
-    }
-    [a, b, c, d, e].forEach((v, i) => (h[i] = (h[i] + v) | 0));
-  }
-  return h.map((v) => (v >>> 0).toString(16).padStart(8, "0")).join("");
-}
-
-// What the website sends to say whose session this is, to the site at origin.
-function authHeaders(origin = site) {
-  const sapisid = cookieValue("__Secure-3PAPISID") || cookieValue("SAPISID");
-  if (!sapisid) return {};
-  const now = Math.floor(Date.now() / 1000);
-  return {
-    cookie: cookie(),
-    authorization: `SAPISIDHASH ${now}_${sha1(`${now} ${sapisid} ${origin}`)}`,
-    "x-goog-authuser": "0",
-  };
+  if (!signedIn()) throw fail("signIn");
 }
 
 function clientVersion() {
@@ -127,6 +79,7 @@ const visionOS = (visitor) => ({
 // call asks the service as the website, or as another of its apps. An
 // anonymous call leaves the session out.
 async function call(endpoint, body, as = remix) {
+  const authenticated = !as.anonymous && signedIn();
   const res = await fetch(`${site}/youtubei/v1/${endpoint}?prettyPrint=false`, {
     method: "POST",
     headers: {
@@ -134,12 +87,12 @@ async function call(endpoint, body, as = remix) {
       "user-agent": webUA,
       origin: site,
       "x-origin": site,
-      ...(as.anonymous ? {} : authHeaders()),
+      ...(authenticated ? accountHeader : {}),
       ...as.headers,
     },
     body: JSON.stringify({ context: { client: { ...as.client, hl: youtubeLanguage() } }, ...body }),
   });
-  if (res.status === 401) {
+  if (res.status === 401 && authenticated) {
     endSession();
     throw fail("signIn", t("Your YouTube Music session has ended: sign in again"));
   }
@@ -362,12 +315,16 @@ function rowsOf(answer) {
 // Account.
 
 export async function account() {
-  if (!cookie()) return null;
+  if (!signedIn()) return null;
   const r = await call("account/account_menu", {});
   const header = findOne(r, "activeAccountHeaderRenderer");
   if (!header) return null;
   const name = textOf(header.accountName);
-  return { id: textOf(header.channelHandle) || name, name, imageUrl: imageOf(header.accountPhoto) };
+  const notice = accountState()?.notice;
+  const sessionNotice = notice === "memory"
+    ? t("The credential store is unavailable. This sign-in may end when MyGo Music closes")
+    : notice === "migration" ? t("The saved YouTube session could not be fully migrated to the credential store") : undefined;
+  return { id: textOf(header.channelHandle) || name, name, imageUrl: imageOf(header.accountPhoto), sessionNotice };
 }
 
 // Signing in is on Google's own page, as YouTube Music's website signs in, in a
@@ -384,15 +341,15 @@ const browserUA =
     : "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36 Edg/130.0.0.0";
 
 export async function signIn() {
+  if (!host.youtubeAccount) throw fail("setup", t("Update MyGo Music to sign in securely"));
   const page = new URL(signInPage);
   page.searchParams.set("hl", youtubeLanguage());
-  const { cookie: session } = await host.webSignIn({
+  await host.webSignIn({
     url: page.href,
     cookiesOf: site,
     until: ["SAPISID", "__Secure-3PSID"],
     userAgent: browserUA,
   });
-  host.storage.set("cookie", session);
   likedSet = null;
   const me = await account();
   if (!me) {
@@ -408,7 +365,7 @@ export function signOut() {
 
 // What's kept of a session goes with it.
 function endSession() {
-  host.storage.remove("cookie");
+  host.youtubeAccount?.signOut();
   likedSet = null;
 }
 
@@ -537,7 +494,7 @@ export { playlistPage as playlist };
 // The app loads this for its sidebar as it starts: no account is no playlists,
 // rather than asking someone who's only browsing to sign in.
 export async function playlists() {
-  if (!cookie()) return [];
+  if (!signedIn()) return [];
   const items = (await sectionsOf(await browseId("FEmusic_liked_playlists"))).flatMap((s) => s.playlists);
   // Liked Music has an entry of its own, and episodes for later aren't songs.
   return items.filter((p) => p.id !== "LM" && p.id !== "SE").map((p) => ({ ...p, saved: true }));
@@ -574,7 +531,7 @@ async function likedIds() {
 }
 
 export async function isLiked({ ids }) {
-  const set = cookie() ? await likedIds() : new Set();
+  const set = signedIn() ? await likedIds() : new Set();
   return Object.fromEntries(ids.map((id) => [id, set.has(id)]));
 }
 
@@ -588,7 +545,7 @@ export async function like({ id, on }) {
 }
 
 export async function recent() {
-  if (!cookie()) return [];
+  if (!signedIn()) return [];
   const sections = await sectionsOf(await browseId("FEmusic_history"));
   return sections.flatMap((s) => s.tracks).slice(0, 50);
 }
@@ -605,7 +562,7 @@ export function stations() {
 // recommendations are made from, as its own player would put it there.
 export async function played({ id }) {
   host.storage.set("lastPlayed", id);
-  if (!cookie()) return;
+  if (!accountState()?.history) return;
   try {
     await report(id);
   } catch (e) {
@@ -619,14 +576,14 @@ async function report(id) {
   if (!base) throw new Error(t("YouTube gave no address to report it to"));
   const url = new URL(base);
   // The session goes with it, so it goes to YouTube alone.
-  if (url.protocol !== "https:" || !/(^|\.)youtube\.com$/.test(url.hostname)) {
+  if (url.origin !== "https://s.youtube.com" || url.pathname !== "/api/stats/playback") {
     throw new Error(`not sending your session to ${url.hostname}`);
   }
   url.searchParams.set("ver", "2");
   url.searchParams.set("c", "WEB_REMIX");
   url.searchParams.set("cpn", playbackNonce());
   const res = await fetch(url.href, {
-    headers: { "user-agent": webUA, referer: `${site}/`, ...authHeaders(url.origin) },
+    headers: { "user-agent": webUA, referer: `${site}/`, ...accountHeader },
   });
   if (!res.ok) throw new Error(`${res.status}`);
 }
@@ -771,6 +728,7 @@ async function youtubeLyrics(next) {
 // Playing.
 
 const installed = {};
+const anonymousYtdlpArgs = ["--ignore-config", "--no-plugin-dirs", "--no-cookies", "--no-cookies-from-browser"];
 
 // GUI apps don't get a shell's PATH, so where Homebrew installs programs is
 // tried too. Those are the places the process permission in plugin.json names,
@@ -779,9 +737,10 @@ const installed = {};
 async function program(name, versionFlag) {
   if (installed[name]) return installed[name];
   const places = [name, `/opt/homebrew/bin/${name}`, `/usr/local/bin/${name}`];
+  const args = name === "yt-dlp" ? [...anonymousYtdlpArgs, versionFlag] : [versionFlag];
   for (const path of places) {
     try {
-      const proc = host.spawn(path, [versionFlag]);
+      const proc = host.spawn(path, args);
       proc.closeStdin();
       while ((await proc.readLine()) !== null) {}
       if ((await proc.wait()) === 0) {
@@ -902,25 +861,20 @@ function gainOf(audio) {
   return Math.round((-18 - lkfs) * 100) / 100;
 }
 
-// The cookie goes to yt-dlp on its standard input, as anyone on this machine can
-// read the arguments of a program.
-function ytdlpConfig() {
-  const c = cookie();
-  return c ? `--add-headers "Cookie:${c.replace(/[\\"]/g, "\\$&")}"\n` : "";
-}
-
 const ytdlpTimeout = 25000;
 
 // yt-dlp finds the audio as YouTube's website does, which takes it a few
 // seconds, and a JavaScript runtime to work out YouTube's challenges. Without
-// it, what went wrong without it stands.
+// it, what went wrong without it stands. Playback resolves as a visitor even
+// when the listener is signed in to their library.
 async function throughYtdlp(id, why) {
   const ytdlp = await program("yt-dlp", "--version");
   if (!ytdlp) throw why;
   const args = [
-    "--config-locations", "-",
+    ...anonymousYtdlpArgs,
     "--no-warnings", "--no-playlist", "--no-progress",
-    ...whatYtdlpAsks(),
+    "--extractor-args", "youtube:skip=hls,dash",
+    "--format", "bestaudio[protocol^=http]/bestaudio",
     "--print", "%(.{url,http_headers,ext,acodec,protocol,vcodec,abr,filesize})j",
   ];
   for (const runtime of ["deno", "node", "bun"]) {
@@ -933,7 +887,6 @@ async function throughYtdlp(id, why) {
   args.push(`https://www.youtube.com/watch?v=${id}`);
 
   const proc = host.spawn(ytdlp, args);
-  proc.write(ytdlpConfig());
   proc.closeStdin();
   const timer = setTimeout(() => proc.kill(), ytdlpTimeout);
   const lines = [];
@@ -954,26 +907,11 @@ async function throughYtdlp(id, why) {
   };
 }
 
-// Which of YouTube's apps yt-dlp asks as, and for what. Signed out, its own
-// choice works, and the audio alone, as one file. With a session it asks as the
-// embedded player, whose addresses YouTube now turns down with no token from
-// its JavaScript, which yt-dlp can't make. Safari's are good, but only as HLS,
-// with video: at 360p, its audio is the AAC YouTube has on its own.
-function whatYtdlpAsks() {
-  if (!cookie()) {
-    return ["--extractor-args", "youtube:skip=hls,dash", "--format", "bestaudio[protocol^=http]/bestaudio"];
-  }
-  return [
-    "--extractor-args", "youtube:player_client=web_safari",
-    "--format", "bestaudio[protocol^=m3u8]/93/94/92/95/91",
-  ];
-}
-
 function ytdlpFailure(output) {
   const said = output.split("\n").reverse().find((l) => l.startsWith("ERROR:")) || output.trim() || "yt-dlp stopped";
   const why = said.replace(/^ERROR:\s*(\[[^\]]*\]\s*)?(\S+:\s*)?/, "");
   if (/not a bot|sign in|cookies/i.test(why)) {
-    return fail("signIn", cookie() ? t("YouTube turned down your session: sign in again") : t("YouTube asks you to sign in to play this"));
+    return new Error(t("YouTube did not allow anonymous playback of this track"));
   }
   if (/unavailable|private|removed|not available|premium/i.test(why)) return fail("unavailable", why);
   return new Error(why);
