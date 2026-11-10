@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 
 globalThis.host = { t: (text) => text, language: () => "en", platform: "win32", storage: new Map() };
-const { stream } = await import("../index.js");
+const { stream, streamWithOpus } = await import("../index.js");
 
 test("native playback, stream copy, and transcoding follow host capabilities", async () => {
   const originalFetch = globalThis.fetch;
@@ -27,6 +27,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
       streamingData: {
         adaptiveFormats: videoId === "with-aac"
           ? [input.opus, input.aac, { ...input.aac, url: "https://audio.example/drc", bitrate: 200000, isDrc: true }]
+          : videoId === "aac-only" ? [input.aac]
           : [input.opus, { mimeType: 'audio/mp4; codecs="mp4a.40.5"', url: "https://audio.example/he-aac", bitrate: 50000 }],
       },
     });
@@ -59,6 +60,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
   try {
     const direct = await stream({ id: "with-aac", quality: "standard" });
     expect(direct.type).toBe("m4a");
+    expect(direct).toMatchObject({ codec: "aac-lc", processing: "direct" });
     expect(direct.url).toBe(input.aac.url);
     expect(direct.fallback).toBe(true);
     expect(direct.byteRanges).toBe(true);
@@ -74,23 +76,38 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
 
     const mp3 = await stream({ id: "opus-only", quality: "standard" });
     expect(mp3.type).toBe("mp3");
+    expect(mp3).toMatchObject({ codec: "mp3", processing: "transcode" });
     expect(mp3.bitRate).toBe(128000);
     expect(commands[1][commands[1].indexOf("-i") + 1]).toBe(input.opus.url);
     expect(commands[1][commands[1].indexOf("-c:a") + 1]).toBe("libmp3lame");
     expect(commands[1][commands[1].indexOf("-f") + 1]).toBe("mp3");
+
+    // A host that can decode Ogg Opus only needs FFmpeg to move the packets.
+    const supportsAAC = globalThis.host.supportsAudio;
+    globalThis.host.supportsAudio = (container, codec, delivery) =>
+      supportsAAC(container, codec, delivery) || (container === "ogg" && codec === "opus" && delivery === "progressive");
+    const ogg = await stream({ id: "opus-only", quality: "standard" });
+    expect(ogg.type).toBe("ogg");
+    expect(ogg).toMatchObject({ codec: "opus", processing: "remux" });
+    expect(ogg.bitRate).toBe(input.opus.bitrate);
+    expect(ogg.byteRanges).toBeUndefined();
+    expect(commands[2][commands[2].indexOf("-i") + 1]).toBe(input.opus.url);
+    expect(commands[2][commands[2].indexOf("-c:a") + 1]).toBe("copy");
+    expect(commands[2][commands[2].indexOf("-f") + 1]).toBe("ogg");
 
     // Even a signed-in listener resolves fallback audio without account cookies.
     globalThis.host.youtubeAccount = { state: () => ({ active: true }) };
     const hls = await stream({ id: "hls", quality: "standard" });
     expect(hls.type).toBe("aac");
     expect(hls.byteRanges).toBeUndefined();
-    expect(commands[2][commands[2].indexOf("-c:a") + 1]).toBe("copy");
-    expect(commands[2][commands[2].indexOf("-f") + 1]).toBe("adts");
+    expect(commands[3][commands[3].indexOf("-c:a") + 1]).toBe("copy");
+    expect(commands[3][commands[3].indexOf("-f") + 1]).toBe("adts");
 
     const resolved = await stream({ id: "yt-dlp-direct", quality: "standard" });
     expect(resolved.byteRanges).toBe(true);
+    expect(resolved.resolver).toBe("anonymous-yt-dlp");
     expect(resolved.size).toBe(1200000);
-    expect(commands).toHaveLength(3);
+    expect(commands).toHaveLength(4);
     await expect(stream({ id: "yt-dlp-blocked", quality: "standard" })).rejects.toThrow(
       "YouTube did not allow anonymous playback of this track",
     );
@@ -109,7 +126,21 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     delete globalThis.host.supportsAudio;
     const legacy = await stream({ id: "with-aac", quality: "standard" });
     expect(legacy.type).toBe("aac");
-    expect(commands[3][commands[3].indexOf("-c:a") + 1]).toBe("copy");
+    expect(commands[4][commands[4].indexOf("-c:a") + 1]).toBe("copy");
+
+    globalThis.host.supportsAudio = (container, codec, delivery) =>
+      supportsAAC(container, codec, delivery) || (container === "ogg" && codec === "opus" && delivery === "progressive");
+    const preferred = await streamWithOpus({ id: "with-aac", quality: "standard" });
+    expect(preferred).toMatchObject({ type: "ogg", codec: "opus", processing: "remux", fallback: true });
+    expect(commands[5][commands[5].indexOf("-i") + 1]).toBe(input.opus.url);
+    expect(commands[5][commands[5].indexOf("-c:a") + 1]).toBe("copy");
+    expect(await stream({ id: "with-aac", quality: "standard" })).toMatchObject({ type: "m4a", codec: "aac-lc" });
+    expect(await streamWithOpus({ id: "aac-only", quality: "standard" })).toMatchObject({ type: "m4a", codec: "aac-lc" });
+    expect(await streamWithOpus({ id: "with-aac", quality: "standard", fallback: true })).toMatchObject({ type: "m4a", codec: "aac-lc" });
+    expect(await streamWithOpus({ id: "yt-dlp-direct", quality: "standard" })).toMatchObject({ type: "m4a", resolver: "anonymous-yt-dlp" });
+    const { args: preferredArgs } = ytdlpRuns.at(-1);
+    expect(preferredArgs[preferredArgs.indexOf("--format") + 1]).toStartWith("bestaudio[acodec=opus]");
+    expect(preferredArgs).toContain("--no-cookies");
   } finally {
     for (const resolve of finish) resolve(0);
     delete globalThis.host.youtubeAccount;

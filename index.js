@@ -762,21 +762,21 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 const located = new Map();
 const locatedFor = 60 * 60 * 1000;
 
-async function locate(id) {
-  const known = located.get(id);
+async function locate(id, preferOpus, key) {
+  const known = located.get(key);
   if (known && Date.now() - known.at < locatedFor) return known;
   let found;
   try {
-    found = await direct(id);
+    found = await direct(id, preferOpus);
   } catch (e) {
     // What YouTube won't play, yt-dlp can't either.
     if (e.code === "unavailable") throw e;
     console.warn(`finding ${id}'s audio: ${e.message}`);
     visitor = "";
-    found = await throughYtdlp(id, e);
+    found = await throughYtdlp(id, e, preferOpus);
   }
   found.at = Date.now();
-  located.set(id, found);
+  located.set(key, found);
   return found;
 }
 
@@ -816,7 +816,7 @@ function playbackPlan(source, allowDirect) {
 
 // Prefer direct playback, then a stream copy. Within each route keep the
 // highest bitrate in the track's own language and without range compression.
-async function direct(id) {
+async function direct(id, preferOpus) {
   const r = await call("player", { videoId: id, contentCheckOk: true, racyCheckOk: true }, visionOS(await visitorData()));
   const status = r.playabilityStatus || {};
   if (status.status !== "OK") {
@@ -838,7 +838,8 @@ async function direct(id) {
       size: Number(f.contentLength) || undefined,
     };
     const plan = playbackPlan(candidate, true);
-    const rank = plan.direct ? 2 : plan.muxer ? 1 : 0;
+    const rank = (plan.direct ? 2 : plan.muxer ? 1 : 0)
+      + (preferOpus && candidate.codec === "opus" && (plan.direct || plan.muxer) ? 3 : 0);
     if (rank > bestRank || (rank === bestRank && candidate.bitRate > best.bitRate)) {
       best = candidate;
       bestRank = rank;
@@ -867,14 +868,16 @@ const ytdlpTimeout = 25000;
 // seconds, and a JavaScript runtime to work out YouTube's challenges. Without
 // it, what went wrong without it stands. Playback resolves as a visitor even
 // when the listener is signed in to their library.
-async function throughYtdlp(id, why) {
+async function throughYtdlp(id, why, preferOpus) {
   const ytdlp = await program("yt-dlp", "--version");
   if (!ytdlp) throw why;
   const args = [
     ...anonymousYtdlpArgs,
     "--no-warnings", "--no-playlist", "--no-progress",
     "--extractor-args", "youtube:skip=hls,dash",
-    "--format", "bestaudio[protocol^=http]/bestaudio",
+    "--format", preferOpus && supportsAudio("ogg", "opus", "progressive")
+      ? "bestaudio[acodec=opus][protocol^=http]/bestaudio[ext=m4a][protocol^=http]/bestaudio[protocol^=http]/bestaudio"
+      : "bestaudio[protocol^=http]/bestaudio",
     "--print", "%(.{url,http_headers,ext,acodec,protocol,vcodec,abr,filesize})j",
   ];
   for (const runtime of ["deno", "node", "bun"]) {
@@ -988,15 +991,23 @@ async function serve(source, plan, bitRate) {
   return `http://127.0.0.1:${port}/`;
 }
 
-export async function stream({ id, quality, fallback }) {
+export function streamWithOpus({ id, quality, fallback }) {
+  return stream({ id, quality, preferOpus: !fallback });
+}
+
+export async function stream({ id, quality, fallback, preferOpus = false }) {
   const kbps = quality === "standard" ? 128 : 192;
-  let source = await locate(id);
+  const key = preferOpus ? `opus:${id}` : id;
+  let source = await locate(id, preferOpus, key);
   let plan = playbackPlan(source, !fallback);
   if (plan.direct) {
     const size = Number.isSafeInteger(source.size) && source.size > 0 ? source.size : undefined;
     return {
       url: source.url,
       type: plan.type,
+      codec: source.codec,
+      processing: "direct",
+      resolver: source.direct ? undefined : "anonymous-yt-dlp",
       headers: source.http_headers?.["User-Agent"] ? { "User-Agent": source.http_headers["User-Agent"] } : undefined,
       size,
       byteRanges: plan.type === "m4a" && size !== undefined,
@@ -1012,19 +1023,23 @@ export async function stream({ id, quality, fallback }) {
   } catch (e) {
     // An address may stop working before it said it would, and YouTube now and
     // then turns down one it just gave out: yt-dlp may find one that works.
-    located.delete(id);
+    located.delete(key);
     if (!source.direct || e.code === "setup") throw e;
     console.warn(`playing ${id} as YouTube gave it: ${e.message}`);
-    source = { ...(await throughYtdlp(id, e)), gain: source.gain, at: Date.now() };
+    source = { ...(await throughYtdlp(id, e, preferOpus)), gain: source.gain, at: Date.now() };
     plan = playbackPlan(source, false);
     url = await serve(source, plan, kbps);
-    located.set(id, source);
+    located.set(key, source);
   }
   return {
     url,
     type: plan.type,
+    codec: plan.muxer ? source.codec : "mp3",
+    processing: plan.muxer ? "remux" : "transcode",
+    resolver: source.direct ? undefined : "anonymous-yt-dlp",
     quality: kbps === 128 ? "standard" : "high",
     bitRate: plan.muxer ? source.bitRate : kbps * 1000,
     gain: source.gain,
+    fallback: preferOpus && source.codec === "opus" && !!plan.muxer,
   };
 }
