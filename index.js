@@ -138,6 +138,7 @@ const pageTypeOf = (nav) =>
   nav?.browseEndpoint?.browseEndpointContextSupportedConfigs?.browseEndpointContextMusicConfig?.pageType || "";
 
 const plainPlaylistId = (id) => (id || "").replace(/^VL/, "");
+const isShowId = (id) => /^MPSP[\w-]+$/.test(id || "");
 
 // What a line of credits names: who, on which album, and for how long.
 function creditsOf(runs) {
@@ -192,7 +193,7 @@ function rowOf(r) {
     const grey = r.musicItemRendererDisplayPolicy === "MUSIC_ITEM_RENDERER_DISPLAY_POLICY_GREY_OUT";
     return { kind: "track", value: trackFrom(videoId, name, credits, image, grey) };
   }
-  const target = r.navigationEndpoint;
+  const target = r.navigationEndpoint || nav;
   return collectionOf(target, name, runs, image);
 }
 
@@ -200,8 +201,8 @@ function rowOf(r) {
 function cardOf(r) {
   const name = textOf(r.title);
   const runs = r.subtitle?.runs || [];
-  const image = imageOf(r.thumbnailRenderer);
-  const nav = r.navigationEndpoint;
+  const image = imageOf(r.thumbnailRenderer || r.thumbnail);
+  const nav = r.navigationEndpoint || r.title?.runs?.[0]?.navigationEndpoint;
   if (nav?.watchEndpoint?.videoId) {
     const credits = creditsOf(runs);
     // On a card, words come first that say what it is.
@@ -215,6 +216,9 @@ function collectionOf(nav, name, runs, image) {
   const id = nav?.browseEndpoint?.browseId;
   if (!id) return null;
   const credits = creditsOf(runs);
+  if (isShowId(id) || pageTypeOf(nav) === "MUSIC_PAGE_TYPE_PODCAST_SHOW_DETAIL_PAGE") {
+    return { kind: "show", value: { id, name, imageUrl: image, publisher: credits.artists[0]?.name || credits.names.at(-1) } };
+  }
   switch (pageTypeOf(nav)) {
     case "MUSIC_PAGE_TYPE_ARTIST":
     case "MUSIC_PAGE_TYPE_USER_CHANNEL":
@@ -228,12 +232,37 @@ function collectionOf(nav, name, runs, image) {
   return null;
 }
 
+const podcastEpisodes = new Set();
+
+function episodeOf(r, show = {}) {
+  const videoId = r.onTap?.watchEndpoint?.videoId ||
+    r.title?.runs?.[0]?.navigationEndpoint?.browseEndpoint?.browseId?.match(/^MPED([\w-]{11})$/)?.[1];
+  const name = textOf(r.title);
+  if (!videoId || !name) return null;
+  const showRun = r.subtitle?.runs?.find((run) => isShowId(run.navigationEndpoint?.browseEndpoint?.browseId));
+  const showId = show.id || showRun?.navigationEndpoint.browseEndpoint.browseId ||
+    findAll(r.menu, "browseEndpoint").find((entry) => isShowId(entry.browseId))?.browseId;
+  if (!showId) return null;
+  podcastEpisodes.add(videoId);
+  const publisher = show.publisher || showRun?.text;
+  const credits = creditsOf(publisher ? [{ text: publisher }] : []);
+  const duration = r.playbackProgress?.musicPlaybackProgressRenderer?.durationText;
+  credits.duration = msOf(textOf(duration)) || (duration?.runs || []).reduce((ms, run) => ms || msOf(run.text), 0);
+  return {
+    ...trackFrom(videoId, name, credits, imageOf(r.thumbnail) || show.imageUrl),
+    showId,
+    description: textOf(r.description),
+  };
+}
+
 function itemsOf(list) {
   const out = [];
   for (const item of list || []) {
     const row = item.musicResponsiveListItemRenderer;
     const card = item.musicTwoRowItemRenderer;
-    const got = row ? rowOf(row) : card ? cardOf(card) : null;
+    const multi = item.musicMultiRowListItemRenderer;
+    const episode = multi && episodeOf(multi);
+    const got = episode ? { kind: "track", value: episode } : row ? rowOf(row) : cardOf(card || multi || {});
     if (got) out.push(got);
   }
   return out;
@@ -267,16 +296,24 @@ async function sectionsOf(answer) {
   for (const list of findAll(answer, "sectionListRenderer").concat(findAll(answer, "sectionListContinuation"))) {
     for (const entry of list.contents || []) {
       const shelf =
-        entry.musicCarouselShelfRenderer || entry.musicShelfRenderer || entry.musicPlaylistShelfRenderer || entry.gridRenderer;
-      if (!shelf) continue;
+        entry.musicCarouselShelfRenderer || entry.musicImmersiveCarouselShelfRenderer ||
+        entry.musicShelfRenderer || entry.musicPlaylistShelfRenderer || entry.gridRenderer;
+      if (!shelf) {
+        const links = categoryLinks(entry, "musicNavigationButtonRenderer");
+        if (links.length) sections.push({ links });
+        continue;
+      }
       const items = itemsOf(shelf.contents || shelf.items);
-      if (!items.length) continue;
+      const links = categoryLinks(shelf, "musicNavigationButtonRenderer");
+      if (!items.length && !links.length) continue;
       sections.push({
         title: shelfTitle(shelf),
         tracks: await withDurations(ofKind(items, "track")),
         albums: ofKind(items, "album"),
         artists: ofKind(items, "artist"),
         playlists: ofKind(items, "playlist"),
+        shows: ofKind(items, "show"),
+        links,
       });
     }
   }
@@ -373,9 +410,27 @@ function endSession() {
 
 // Pages.
 
+function categoryLinks(answer, renderer) {
+  const links = new Map();
+  for (const item of findAll(answer, renderer)) {
+    const endpoint = findAll(item.navigationEndpoint || item.clickCommand || item, "browseEndpoint")
+      .find((entry) => /^FEmusic_[\w]+$/.test(entry.browseId || ""));
+    const title = textOf(item.text) || textOf(item.buttonText) || textOf(item.title);
+    if (!endpoint || !title || item.isSelected) continue;
+    const { browseId, params } = endpoint;
+    const page = "category:" + encodeURIComponent(JSON.stringify([browseId, params || "", title]));
+    links.set(page, { title, page });
+  }
+  return [...links.values()];
+}
+
+const homeCategories = (answer) => categoryLinks(answer, "chipCloudChipRenderer");
+
 export async function home() {
   const answer = await browseId("FEmusic_home");
   const sections = await sectionsOf(answer);
+  const links = homeCategories(answer);
+  if (links.length) sections.unshift({ title: t("Recommendations"), links });
   // It comes in a few pages. Two more make a page that's worth scrolling.
   let token = nextToken(findOne(answer, "sectionListRenderer"));
   for (let i = 0; token && i < 2; i++) {
@@ -387,10 +442,78 @@ export async function home() {
 }
 
 export async function browse({ page }) {
-  const ids = { charts: ["FEmusic_charts", "Charts"], new: ["FEmusic_new_releases", "New Releases"] };
+  if (page === "podcasts") {
+    const links = homeCategories(await browseId("FEmusic_home"));
+    const podcast = links.find((link) => /^(podcasts?|播客)$/i.test(link.title));
+    if (podcast) return { ...await browse(podcast), title: t("Podcasts") };
+    return { title: t("Podcasts"), sections: await sectionsOf(await browseId("FEmusic_podcasts")) };
+  }
+  if (page.startsWith("category:")) {
+    const [browseId, params, title] = JSON.parse(decodeURIComponent(page.slice("category:".length)));
+    if (/^FEmusic_[\w]+$/.test(browseId) && typeof params === "string" && typeof title === "string") {
+      const answer = await call("browse", { browseId, ...(params ? { params } : {}) });
+      return { title, sections: await sectionsOf(answer) };
+    }
+  }
+  const ids = {
+    charts: ["FEmusic_charts", "Charts"],
+    new: ["FEmusic_new_releases", "New Releases"],
+    explore: ["FEmusic_explore", "Explore"],
+    moods: ["FEmusic_moods_and_genres", "Moods & Genres"],
+  };
   const known = ids[page];
-  if (known) return { title: t(known[1]), sections: await sectionsOf(await browseId(known[0])) };
+  if (Array.isArray(known)) {
+    const sections = await sectionsOf(await browseId(known[0]));
+    if (page === "explore") {
+      sections.unshift({ links: [
+        ...["moods", "charts", "new"].map((id) => ({ title: t(ids[id][1]), page: id })),
+        { title: t("Podcasts"), page: "podcasts" },
+      ] });
+    }
+    return { title: t(known[1]), sections };
+  }
   throw fail("unavailable", t("no such page"));
+}
+
+export async function shows() {
+  const sections = (await browse({ page: "podcasts" })).sections;
+  return [...new Map(sections.flatMap((section) => section.shows).map((show) => [show.id, show])).values()];
+}
+
+const showHeaders = new Map();
+
+export async function show({ id, offset = 0 }) {
+  if (!isShowId(id)) throw fail("unavailable", t("no such page"));
+  const key = `show\0${id}`;
+  const token = pageToken(key, offset);
+  if (offset > 0 && !token) return { show: { id }, episodes: [], more: false };
+  const answer = token ? await call("browse", { continuation: token }) : await browseId(id);
+  const header = headerOf(answer);
+  const publisher = textOf(header.straplineTextOne);
+  const imageUrl = imageOf(header.thumbnail);
+  const metadata = token ? showHeaders.get(id) || { id } : {
+    id, name: textOf(header.title), publisher, imageUrl,
+    description: textOf(findOne(header.description, "description")) || textOf(header.description),
+  };
+  const shelf = findOne(answer, token ? "musicShelfContinuation" : "musicShelfRenderer");
+  const entries = shelf?.contents || findAll(answer, "appendContinuationItemsAction").flatMap((entry) => entry.continuationItems || []);
+  const episodes = entries.flatMap((entry) => {
+    const episode = entry.musicMultiRowListItemRenderer;
+    const row = entry.musicResponsiveListItemRenderer;
+    if (row) {
+      const item = rowOf(row);
+      if (item?.kind !== "track") return [];
+      podcastEpisodes.add(item.value.id);
+      return [{ ...item.value, showId: id }];
+    }
+    const track = episode && episodeOf(episode, metadata);
+    return track ? [track] : [];
+  });
+  await withDurations(episodes);
+  const more = episodes.length > 0 && keepToken(key, offset + episodes.length, nextToken(shelf || entries));
+  if (more) showHeaders.set(id, metadata);
+  else showHeaders.delete(id);
+  return { show: metadata, episodes, more };
 }
 
 // Search. Each kind has its filter, which the website sends in this form.
@@ -400,6 +523,7 @@ const filters = {
   albums: "EgWKAQIYAWoMEA4QChADEAQQCRAF",
   artists: "EgWKAQIgAWoMEA4QChADEAQQCRAF",
   playlists: "EgeKAQQoAEABagwQDhAKEAMQBBAJEAU%3D",
+  shows: "EgWKAQJQAWoQEBAQCRAEEAMQBRAKEBUQEQ%3D%3D",
 };
 
 export async function search({ query, kind, offset }) {
@@ -410,7 +534,7 @@ export async function search({ query, kind, offset }) {
   if (offset > 0 && !token) return { [kind]: [], more: false };
   const answer = await call("search", token ? { continuation: token } : { query, params: decodeURIComponent(filter) });
   const { items, token: next } = rowsOf(answer);
-  const single = { tracks: "track", albums: "album", artists: "artist", playlists: "playlist" }[kind];
+  const single = { tracks: "track", albums: "album", artists: "artist", playlists: "playlist", shows: "show" }[kind];
   const found = ofKind(items, single);
   if (kind === "tracks") await withDurations(found);
   return { [kind]: found, more: keepToken(key, offset + found.length, next) };

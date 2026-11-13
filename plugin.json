@@ -26,6 +26,16 @@
       "builtin": "home"
     },
     {
+      "title": "Explore",
+      "page": "explore",
+      "icon": "search"
+    },
+    {
+      "title": "Podcasts",
+      "page": "podcasts",
+      "icon": "podcast"
+    },
+    {
       "title": "Charts",
       "page": "charts",
       "icon": "chart"
