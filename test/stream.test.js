@@ -157,7 +157,7 @@ test("native playback, stream copy, and transcoding follow host capabilities", a
     globalThis.fetch = originalFetch;
   }
 });
-test("only an explicit Music Premium restriction retries with the signed-in account", async () => {
+test("account retry requires a Premium restriction or a known Podcast with a login challenge", async () => {
   const originalFetch = globalThis.fetch;
   let active = true;
   const requests = [];
@@ -174,10 +174,22 @@ test("only an explicit Music Premium restriction retries with the signed-in acco
       return Response.json({ responseContext: { visitorData: "guest" } });
     }
     const { videoId, context: { client } } = JSON.parse(options.body);
+    if (url.includes("/browse?")) {
+      return Response.json({ musicShelfRenderer: { contents: [{
+        musicMultiRowListItemRenderer: {
+          title: { simpleText: "Episode" },
+          onTap: { watchEndpoint: { videoId: "episode1234" } },
+          playbackProgress: { musicPlaybackProgressRenderer: { durationText: { simpleText: "12:34" } } },
+        },
+      }] } });
+    }
     requests.push({ videoId, account, client: client.clientName });
     const success = (source) => Response.json({ playabilityStatus: { status: "OK" }, streamingData: { adaptiveFormats: [source] } });
     if (videoId === "public") return success({ ...audio, url: "https://audio.example/public" });
     if (videoId === "other-block") return Response.json({ playabilityStatus: { status: "UNPLAYABLE", reason: "Not available in your country" } });
+    if (!account && videoId === "episode1234") {
+      return Response.json({ playabilityStatus: { status: "LOGIN_REQUIRED", reason: "登入帳戶以確認你不是機器人" } });
+    }
     if (!account) return Response.json({ playabilityStatus: { status: "UNPLAYABLE", reason: guestReason } });
     if (videoId === "premium-cipher") return success({ ...audio, signatureCipher: "example" });
     if (videoId === "premium-foreign") return success({ ...audio, url: "https://googlevideo.com.example.net/audio" });
@@ -201,13 +213,18 @@ test("only an explicit Music Premium restriction retries with the signed-in acco
     });
     await expect(stream({ id: "premium-foreign", quality: "high" })).rejects.toThrow("did not provide a directly playable audio stream");
     await expect(stream({ id: "other-block", quality: "high" })).rejects.toThrow("Not available in your country");
+    const { show } = await import("../index.js");
+    expect((await show({ id: "MPSPTest" })).episodes[0].showId).toBe("MPSPTest");
+    expect(await stream({ id: "episode1234" })).toMatchObject({ processing: "direct", fallback: false });
     active = false;
+    await expect(stream({ id: "episode1234" })).rejects.toMatchObject({ code: "signIn" });
     await expect(stream({ id: "premium-direct", quality: "high" })).rejects.toThrow(guestReason);
     expect(requests.map(({ videoId, account }) => [videoId, account])).toEqual([
       ["public", false], ["premium-direct", false], ["premium-direct", true],
       ["premium-cipher", false], ["premium-cipher", true],
       ["premium-cipher", false], ["premium-cipher", true],
       ["premium-foreign", false], ["premium-foreign", true], ["other-block", false],
+      ["episode1234", false], ["episode1234", true], ["episode1234", false],
       ["premium-direct", false],
     ]);
     expect(requests.filter((r) => r.account).every((r) => r.client === "WEB_REMIX")).toBe(true);

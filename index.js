@@ -918,8 +918,8 @@ async function locate(id, preferOpus, key) {
   try {
     found = await direct(id, preferOpus);
   } catch (e) {
-    if (e.code === "premium") {
-      if (!signedIn()) throw fail("unavailable", e.message);
+    if (e.code === "premium" || e.code === "podcastSignIn") {
+      if (!signedIn()) throw fail(e.code === "podcastSignIn" ? "signIn" : "unavailable", e.message);
       // Account-authorized media addresses are not reused by a later session.
       return direct(id, preferOpus, true);
     }
@@ -986,6 +986,10 @@ async function direct(id, preferOpus, account = false) {
     if (!account && status.status === "UNPLAYABLE" &&
         /(?:only available to|available only to|exclusive to) (?:YouTube )?Music Premium members|(?:僅供|仅供|只限|只供).*Music Premium/i.test(why)) {
       throw fail("premium", why);
+    }
+    if (!account && podcastEpisodes.has(id) && status.status === "LOGIN_REQUIRED" &&
+        /sign in to confirm (?:that )?you(?:'re|’re| are) not a bot|登[入录錄].*確認你不是機器人|登录.*确认你不是机器人/i.test(why)) {
+      throw fail("podcastSignIn", why);
     }
     if (account) throw new Error(why);
     throw status.status === "UNPLAYABLE" || status.status === "ERROR" ? fail("unavailable", why) : new Error(why);
